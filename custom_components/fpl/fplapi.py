@@ -6,6 +6,7 @@ from datetime import timedelta, datetime, date as dt
 import aiohttp
 import async_timeout
 import json
+import sys
 
 
 from bs4 import BeautifulSoup
@@ -15,9 +16,11 @@ STATUS_CATEGORY_OPEN = "OPEN"
 LOGIN_RESULT_OK = "OK"
 LOGIN_RESULT_INVALIDUSER = "NOTVALIDUSER"
 LOGIN_RESULT_INVALIDPASSWORD = "FAILEDPASSWORD"
+LOGIN_RESULT_UNAUTHORIZED = "UNAUTHORIZED"
+LOGIN_RESULT_FAILURE = "FAILURE"
 
 _LOGGER = logging.getLogger(__name__)
-TIMEOUT = 5
+TIMEOUT = 30
 
 URL_LOGIN = "https://www.fpl.com/api/resources/login"
 URL_RESOURCES_HEADER = "https://www.fpl.com/api/resources/header"
@@ -38,16 +41,17 @@ class FplApi(object):
         self._loop = loop
         self._session = None
 
-    async def get_data(self):
+    async def get_data(self) -> dict:
         self._session = aiohttp.ClientSession()
         data = {}
-        await self.login()
-        accounts = await self.async_get_open_accounts()
+        data["accounts"] = []
+        if await self.login() == LOGIN_RESULT_OK:
+            accounts = await self.async_get_open_accounts()
 
-        data["accounts"] = accounts
-        for account in accounts:
-            accountData = await self.__async_get_data(account)
-            data[account] = accountData
+            data["accounts"] = accounts
+            for account in accounts:
+                accountData = await self.__async_get_data(account)
+                data[account] = accountData
 
         await self._session.close()
 
@@ -63,48 +67,55 @@ class FplApi(object):
 
         _LOGGER.info("Logging")
         """login and get account information"""
-        async with async_timeout.timeout(TIMEOUT, loop=self._loop):
-            response = await session.get(
-                URL_LOGIN, auth=aiohttp.BasicAuth(self._username, self._password)
-            )
+        result = LOGIN_RESULT_OK
+        try:
+            async with async_timeout.timeout(TIMEOUT, loop=self._loop):
+                response = await session.get(
+                    URL_LOGIN, auth=aiohttp.BasicAuth(self._username, self._password)
+                )
 
-        js = json.loads(await response.text())
+            js = json.loads(await response.text())
 
-        if response.reason == "Unauthorized":
-            await session.close()
-            raise Exception(js["messageCode"])
+            if response.reason == "Unauthorized":
+                result = LOGIN_RESULT_UNAUTHORIZED
 
-        if js["messages"][0]["messageCode"] != "login.success":
-            _LOGGER.error(f"Logging Failure")
-            await session.close()
-            raise Exception("login failure")
+            if js["messages"][0]["messageCode"] != "login.success":
+                _LOGGER.error(f"Logging Failure")
+                result = LOGIN_RESULT_FAILURE
 
-        _LOGGER.info(f"Logging Successful")
+            _LOGGER.info(f"Logging Successful")
+
+        except Exception as e:
+            _LOGGER.error(f"Error {e} : {sys.exc_info()[0]}")
+            result = LOGIN_RESULT_FAILURE
 
         if close:
             await session.close()
 
-        return LOGIN_RESULT_OK
+        return result
 
     async def async_get_open_accounts(self):
         _LOGGER.info(f"Getting accounts")
-        async with async_timeout.timeout(TIMEOUT, loop=self._loop):
-            response = await self._session.get(URL_RESOURCES_HEADER)
-
-        js = await response.json()
-        accounts = js["data"]["accounts"]["data"]["data"]
-
         result = []
 
-        for account in accounts:
-            if account["statusCategory"] == STATUS_CATEGORY_OPEN:
-                result.append(account["accountNumber"])
+        try:
+            async with async_timeout.timeout(TIMEOUT, loop=self._loop):
+                response = await self._session.get(URL_RESOURCES_HEADER)
+
+            js = await response.json()
+            accounts = js["data"]["accounts"]["data"]["data"]
+
+            for account in accounts:
+                if account["statusCategory"] == STATUS_CATEGORY_OPEN:
+                    result.append(account["accountNumber"])
+        except Exception as e:
+            _LOGGER.error(f"Getting accounts {e}")
 
         # self._account_number = js["data"]["selectedAccount"]["data"]["accountNumber"]
         # self._premise_number = js["data"]["selectedAccount"]["data"]["acctSecSettings"]["premiseNumber"]
         return result
 
-    async def __async_get_data(self, account):
+    async def __async_get_data(self, account) -> dict:
         _LOGGER.info(f"Getting Data")
         data = {}
 
@@ -167,79 +178,91 @@ class FplApi(object):
         data.update(await self.__getDataFromApplianceUsage(account, currentBillDate))
         return data
 
-    async def __getFromProjectedBill(self, account, premise, currentBillDate):
-        async with async_timeout.timeout(TIMEOUT, loop=self._loop):
-            response = await self._session.get(
-                URL_RESOURCES_PROJECTED_BILL.format(
-                    account=account,
-                    premise=premise,
-                    lastBillDate=currentBillDate.strftime("%m%d%Y"),
+    async def __getFromProjectedBill(self, account, premise, currentBillDate) -> dict:
+        data = {}
+
+        try:
+            async with async_timeout.timeout(TIMEOUT, loop=self._loop):
+                response = await self._session.get(
+                    URL_RESOURCES_PROJECTED_BILL.format(
+                        account=account,
+                        premise=premise,
+                        lastBillDate=currentBillDate.strftime("%m%d%Y"),
+                    )
                 )
-            )
 
-        if response.status == 200:
-            data = {}
-            projectedBillData = (await response.json())["data"]
+            if response.status == 200:
 
-            billToDate = float(projectedBillData["billToDate"])
-            projectedBill = float(projectedBillData["projectedBill"])
-            dailyAvg = float(projectedBillData["dailyAvg"])
-            avgHighTemp = int(projectedBillData["avgHighTemp"])
+                projectedBillData = (await response.json())["data"]
 
-            data["bill_to_date"] = billToDate
-            data["projected_bill"] = projectedBill
-            data["daily_avg"] = dailyAvg
-            data["avg_high_temp"] = avgHighTemp
-            return data
+                billToDate = float(projectedBillData["billToDate"])
+                projectedBill = float(projectedBillData["projectedBill"])
+                dailyAvg = float(projectedBillData["dailyAvg"])
+                avgHighTemp = int(projectedBillData["avgHighTemp"])
 
-        return []
+                data["bill_to_date"] = billToDate
+                data["projected_bill"] = projectedBill
+                data["daily_avg"] = dailyAvg
+                data["avg_high_temp"] = avgHighTemp
+        except:
+            pass
 
-    async def __getBBL_async(self, account, projectedBillData):
+        return data
+
+    async def __getBBL_async(self, account, projectedBillData) -> dict:
         _LOGGER.info(f"Getting budget billing data")
         data = {}
 
         URL = "https://www.fpl.com/api/resources/account/{account}/budgetBillingGraph/premiseDetails"
-        async with async_timeout.timeout(TIMEOUT, loop=self._loop):
-            response = await self._session.get(URL.format(account=account))
-            if response.status == 200:
-                r = (await response.json())["data"]
-                dataList = r["graphData"]
+        try:
+            async with async_timeout.timeout(TIMEOUT, loop=self._loop):
+                response = await self._session.get(URL.format(account=account))
+                if response.status == 200:
+                    r = (await response.json())["data"]
+                    dataList = r["graphData"]
 
-                startIndex = len(dataList) - 1
+                    startIndex = len(dataList) - 1
 
-                billingCharge = 0
-                budgetBillDeferBalance = r["defAmt"]
+                    billingCharge = 0
+                    budgetBillDeferBalance = r["defAmt"]
 
-                projectedBill = projectedBillData["projected_bill"]
-                asOfDays = projectedBillData["as_of_days"]
+                    projectedBill = projectedBillData["projected_bill"]
+                    asOfDays = projectedBillData["as_of_days"]
 
-                for det in dataList:
-                    billingCharge += det["actuallBillAmt"]
+                    for det in dataList:
+                        billingCharge += det["actuallBillAmt"]
 
-                calc1 = (projectedBill + billingCharge) / 12
-                calc2 = (1 / 12) * (budgetBillDeferBalance)
+                    calc1 = (projectedBill + billingCharge) / 12
+                    calc2 = (1 / 12) * (budgetBillDeferBalance)
 
-                projectedBudgetBill = round(calc1 + calc2, 2)
-                bbDailyAvg = round(projectedBudgetBill / 30, 2)
-                bbAsOfDateAmt = round(projectedBudgetBill / 30 * asOfDays, 2)
+                    projectedBudgetBill = round(calc1 + calc2, 2)
+                    bbDailyAvg = round(projectedBudgetBill / 30, 2)
+                    bbAsOfDateAmt = round(projectedBudgetBill / 30 * asOfDays, 2)
 
-                data["budget_billing_daily_avg"] = bbDailyAvg
-                data["budget_billing_bill_to_date"] = bbAsOfDateAmt
+                    data["budget_billing_daily_avg"] = bbDailyAvg
+                    data["budget_billing_bill_to_date"] = bbAsOfDateAmt
 
-                data["budget_billing_projected_bill"] = float(projectedBudgetBill)
+                    data["budget_billing_projected_bill"] = float(projectedBudgetBill)
+        except:
+            pass
 
         URL = "https://www.fpl.com/api/resources/account/{account}/budgetBillingGraph"
 
-        async with async_timeout.timeout(TIMEOUT, loop=self._loop):
-            response = await self._session.get(URL.format(account=account))
-            if response.status == 200:
-                r = (await response.json())["data"]
-                data["bill_to_date"] = float(r["eleAmt"])
-                data["defered_amount"] = float(r["defAmt"])
+        try:
+            async with async_timeout.timeout(TIMEOUT, loop=self._loop):
+                response = await self._session.get(URL.format(account=account))
+                if response.status == 200:
+                    r = (await response.json())["data"]
+                    data["bill_to_date"] = float(r["eleAmt"])
+                    data["defered_amount"] = float(r["defAmt"])
+        except:
+            pass
 
         return data
 
-    async def __getDataFromEnergyService(self, account, premise, lastBilledDate):
+    async def __getDataFromEnergyService(
+        self, account, premise, lastBilledDate
+    ) -> dict:
         _LOGGER.info(f"Getting data from energy service")
         URL = "https://www.fpl.com/dashboard-api/resources/account/{account}/energyService/{account}"
 
@@ -261,6 +284,8 @@ class FplApi(object):
             "applicationPage": "resDashBoard",
         }
 
+        data = {}
+
         async with async_timeout.timeout(TIMEOUT, loop=self._loop):
             response = await self._session.post(URL.format(account=account), json=JSON)
             if response.status == 200:
@@ -268,42 +293,52 @@ class FplApi(object):
                 dailyUsage = []
 
                 totalPowerUsage = 0
+                if "data" in r["DailyUsage"]:
+                    for daily in r["DailyUsage"]["data"]:
+                        if (
+                            "kwhUsed" in daily.keys()
+                            and "billingCharge" in daily.keys()
+                            and "date" in daily.keys()
+                            and "averageHighTemperature" in daily.keys()
+                        ):
+                            dailyUsage.append(
+                                {
+                                    "usage": daily["kwhUsed"],
+                                    "cost": daily["billingCharge"],
+                                    "date": daily["date"],
+                                    "max_temperature": daily["averageHighTemperature"],
+                                }
+                            )
+                            totalPowerUsage += int(daily["kwhUsed"])
 
-                for daily in r["DailyUsage"]["data"]:
-                    if "kwhUsed" in daily.keys():
-                        dailyUsage.append(
-                            {
-                                "usage": daily["kwhUsed"],
-                                "cost": daily["billingCharge"],
-                                "date": daily["date"],
-                                "max_temperature": daily["averageHighTemperature"],
-                            }
-                        )
-                        totalPowerUsage += int(daily["kwhUsed"])
+                    data["total_power_usage"] = totalPowerUsage
+                    data["daily_usage"] = dailyUsage
 
-                return {"total_power_usage": totalPowerUsage, "daily_usage": dailyUsage}
+        return data
 
-        return []
-
-    async def __getDataFromApplianceUsage(self, account, lastBilledDate):
+    async def __getDataFromApplianceUsage(self, account, lastBilledDate) -> dict:
         _LOGGER.info(f"Getting data from applicance usage")
         URL = "https://www.fpl.com/dashboard-api/resources/account/{account}/applianceUsage/{account}"
         JSON = {"startDate": str(lastBilledDate.strftime("%m%d%Y"))}
+        data = {}
+        try:
+            async with async_timeout.timeout(TIMEOUT, loop=self._loop):
+                response = await self._session.post(
+                    URL.format(account=account), json=JSON
+                )
+                if response.status == 200:
+                    electric = (await response.json())["data"]["electric"]
 
-        async with async_timeout.timeout(TIMEOUT, loop=self._loop):
-            response = await self._session.post(URL.format(account=account), json=JSON)
-            if response.status == 200:
-                electric = (await response.json())["data"]["electric"]
-                data = {}
-                full = 100
-                for e in electric:
-                    rr = round(float(e["percentageDollar"]))
-                    if rr < full:
-                        full = full - rr
-                    else:
-                        rr = full
-                    data[e["category"].replace(" ", "_")] = rr
+                    full = 100
+                    for e in electric:
+                        rr = round(float(e["percentageDollar"]))
+                        if rr < full:
+                            full = full - rr
+                        else:
+                            rr = full
+                        data[e["category"].replace(" ", "_")] = rr
 
-                return {"energy_percent_by_applicance": data}
+        except:
+            pass
 
-        return []
+        return {"energy_percent_by_applicance": data}
